@@ -1,0 +1,32 @@
+KUtrace for NVIDIA Grace (GB200/GB300), Ubuntu linux-nvidia 6.17, arm64
+
+Base tree: https://github.com/NVIDIA/NV-Kernels branch 24.04_linux-nvidia-6.17-next
+  commit 3821e78ca70f77f052b97adf1f06425437772b31
+  (Ubuntu-nvidia-6.17-6.17.0-1032.32, Linux 6.17.13)
+Flavour: Ubuntu nvidia-64k (config from debian.nvidia-6.17/config/annotations)
+
+STATUS: cross-compiled only (clang, LLVM=1, nvidia-64k config + CONFIG_KUTRACE=y).
+Not yet booted or traced on Grace hardware.
+
+(1) Patch and build
+$ git clone --depth 1 -b 24.04_linux-nvidia-6.17-next https://github.com/NVIDIA/NV-Kernels
+$ cd NV-Kernels
+$ git apply ../kutrace_patch_arm64_linux-nvidia-6.17.patch
+$ scripts/config --enable KUTRACE
+  then build and install as usual for your distro.
+
+(2) Module: build ../module with KDIR pointing at this tree
+$ make -C ../module KDIR=/path/to/NV-Kernels
+$ sudo insmod kutrace_mod.ko tracemb=<MB>   [llc_event=0x17 if LL_CACHE_MISS_RD reads zero]
+
+(3) Postproc: build ../../postproc natively on the Grace node. Regenerate the
+device-IRQ names for that node with
+$ postproc/gen_irqnames_from_proc.py postproc/kutrace_control_names_linux_grace.h
+
+Notes
+ - Run kutrace_control on the host, not inside a container: the default
+   seccomp profile blocks syscall 1023.
+ - Device IRQs are recorded as Linux virq % 236; 236 is the arch timer,
+   246..253 are the arm64 IPIs, 254 is the WFI idle hint.
+ - The time base is CNTVCT >> 4 (1 GHz -> 62.5 MHz); kutrace_lib.cc applies
+   the same shift in user space.
