@@ -21,8 +21,12 @@
 #elif IsIntel_64
 #include "kutrace_control_names_i3.h"
 
-#elif IsRPi4_64
+#elif IsRPi4_64 && defined(KUTRACE_RPI4)
 #include "kutrace_control_names_rpi4.h"
+
+#elif IsArm_64
+// NVIDIA Grace and other arm64 servers, Linux 6.17/7.0
+#include "kutrace_control_names_linux_grace.h"
 
 #else
 #error Need control_names for your architecture

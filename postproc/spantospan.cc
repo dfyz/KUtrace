@@ -67,7 +67,7 @@ typedef struct {
   SpanMap spanmap;
 } CPUstate;
 
-static const int kMaxCpus = 80;
+static const int kMaxCpus = 256;	// GB300 compute tray: 2 x 72 Grace cores
 
 
 // Globals

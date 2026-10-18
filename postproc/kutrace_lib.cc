@@ -104,6 +104,24 @@ int64 GetUsec() {
 #endif
 
 
+#if defined(__aarch64__)
+/* Must match kutrace_mod.c ku_setup_arm64(): shift CNTVCT down to <= 64 MHz. */
+/* RPi4 (54 MHz) gets shift 0; Grace (1 GHz) gets shift 4 = 62.5 MHz.         */
+/* rawtoevent rejects time bases above 100 MHz, so raw 1 GHz would not work.  */
+static int ku_cntvct_shift(void)
+{
+	static int shift = -1;
+	if (shift < 0) {
+		u64 cntfrq;
+		int s = 0;
+		asm volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+		while ((cntfrq >> s) > 64000000) {++s;}
+		shift = s;
+	}
+	return shift;
+}
+#endif
+
 /* Counts by one for each 64 cycles or so */
 /* x86-64 or Arm or Risc-v specific timer */
 /* Arm-64 returns 32MHz counts: 31.25 ns each */
@@ -114,6 +132,7 @@ inline u64 ku_get_cycles(void)
 	u64 timer_value;
 #if defined(__aarch64__)
 	asm volatile("mrs %0, cntvct_el0" : "=r"(timer_value));
+	timer_value >>= ku_cntvct_shift();
 #elif defined(__ARM_ARCH_ISA_ARM)
 	/* This 32-bit result at 54 MHz RPi4 wraps every 75 seconds */
 	asm volatile("mrrc p15, 1, %Q0, %R0, c14" : "=r" (timer_value));
@@ -331,6 +350,23 @@ void GetModelName(char* modelname, int len) {
   free(arg);
   fclose(cpuinfo);
   StripCRLF(modelname);
+#if defined(__aarch64__)
+  // arm64 /proc/cpuinfo has no "model name"; postproc keys idle-exit latency
+  // tables on this string, so synthesize one from MIDR_EL1 (EL0-readable via
+  // the kernel's trap-and-emulate of ID registers).
+  if (modelname[0] == '\0') {
+    u64 midr;
+    asm volatile("mrs %0, midr_el1" : "=r"(midr));
+    u64 implementer = (midr >> 24) & 0xff;
+    u64 partnum = (midr >> 4) & 0xfff;
+    if (implementer == 0x41 && partnum == 0xd4f) {
+      snprintf(modelname, len, "ARM Neoverse-V2 (NVIDIA Grace)");
+    } else {
+      snprintf(modelname, len, "arm64 implementer 0x%02llx part 0x%03llx",
+               implementer, partnum);
+    }
+  }
+#endif
 }
 
 // Get next interrupt description line from file, if any, and set 

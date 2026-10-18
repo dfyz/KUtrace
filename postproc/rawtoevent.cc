@@ -60,7 +60,7 @@ bool keep_idle = false;
 static const uint64 FINDME = 0;
 
 static const bool TRACEWRAP = false;
-static const int kMAX_CPUS = 80;
+static const int kMAX_CPUS = 256;	// GB300 compute tray: 2 x 72 Grace cores
 static const int mhz_32bit_counts = 54;
 static const int kNetworkMbPerSec = 1000;	// Default: 1 Gb/s
 static const int kDefaultLowResNsec10 = 35;	// Low-res riscv: 0 dur => 350 nsec instead 

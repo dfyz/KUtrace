@@ -123,7 +123,7 @@
 
 static const char* kIdleName = "-idle-";
 static const char* kIdlelpName = "-idlelp-";
-static const int kMAX_CPUS = 80;
+static const int kMAX_CPUS = 256;	// GB300 compute tray: 2 x 72 Grace cores
 static const int kNetworkMbitSec = 1000;	// Default: 1 Gb/s if not in trace
 
 static const uint64 kMIN_CEXIT_DURATION = 10LL;	//  0.100 usec in multiples of 10 nsec
