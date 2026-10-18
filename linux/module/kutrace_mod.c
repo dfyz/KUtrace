@@ -47,6 +47,11 @@
  * dsites 2023.06.22 Trace LLC misses instead of IPC per timespan
  * dsites 2023.06.25 Extend LLC range by 4x
  * dsites 2024.05.29 Combine to do either/both IPC and LLC
+ * 2026.10 Add arm64 server support (NVIDIA Grace / Neoverse V2):
+ *   - time base is CNTVCT_EL0, scaled down to <= 64 MHz (Grace: 1 GHz >> 4)
+ *   - inst_retired/cycles/LLC misses via perf-reserved PMUv3 counters,
+ *     read directly with mrs on the hot path
+ *   - CPU frequency from the AMU core/constant cycle counters
  *
  */
 
@@ -71,8 +76,17 @@
 #include <asm/atomic.h>
 #include <asm/uaccess.h>
 
+#if defined(__aarch64__)
+#include <linux/perf_event.h>
+#include <linux/perf/arm_pmuv3.h>
+#include <asm/arm_pmuv3.h>
+#include <asm/cpufeature.h>
+#include <asm/sysreg.h>
+#endif
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Richard L Sites");
+MODULE_DESCRIPTION("KUtrace kernel/user transition tracing");
 
 // Added 2023.02.13. Move these into the kernel at next build
 #ifndef KUTRACE_CMD_SET4KB
@@ -98,13 +112,47 @@ MODULE_AUTHOR("Richard L Sites");
 //   gcc -dM -E -march=native - < /dev/null 
 
 /* Add others as you find and test them */
-#define Isx86_64	defined(__x86_64)
-#define IsAmd_64	Isx86_64 && defined(__znver1) 
-#define IsIntel_64	Isx86_64 && !defined(__znver1)
+/* NOTE: "#define X defined(Y)" used inside #if is undefined behavior and */
+/* clang warns about it, so compute plain 0/1 values instead.             */
+/* __ARM_ARCH == 8 no longer identifies a Raspberry Pi: a Grace build     */
+/* without -march=native also sees 8. RPi4 builds must say so explicitly. */
+#if defined(__x86_64__)
+#define Isx86_64	1
+#else
+#define Isx86_64	0
+#endif
 
-#define IsArm_64	defined(__aarch64__)
-#define IsRPi4		defined(__ARM_ARCH) && (__ARM_ARCH == 8)
-#define IsRPi4_64	IsRPi4 && IsArm_64
+#if Isx86_64 && defined(__znver1)
+#define IsAmd_64	1
+#else
+#define IsAmd_64	0
+#endif
+
+#if Isx86_64 && !defined(__znver1)
+#define IsIntel_64	1
+#else
+#define IsIntel_64	0
+#endif
+
+#if defined(__aarch64__)
+#define IsArm_64	1
+#else
+#define IsArm_64	0
+#endif
+
+/* make KUTRACE_TARGET=rpi4 (see Makefile) */
+#if IsArm_64 && defined(KUTRACE_RPI4)
+#define IsRPi4_64	1
+#else
+#define IsRPi4_64	0
+#endif
+
+/* Armv8.4+/v9 servers with PMUv3 perf driver and AMU: NVIDIA Grace et al. */
+#if IsArm_64 && !IsRPi4_64
+#define IsGrace_64	1
+#else
+#define IsGrace_64	0
+#endif
 
 
 /* AMD-specific defines           */
@@ -205,7 +253,7 @@ MODULE_AUTHOR("Richard L Sites");
 /*--------------------------------*/
 /* Old 32-bit defines in  linux-4.19.19/arch/arm/kernel/perf_event_v6.c */
 
-#if IsRPi4_64
+#if IsArm_64
 /* This is for 64-bit ARM */
 typedef long long int int64;
 typedef long long unsigned int uint64;
@@ -242,6 +290,9 @@ typedef long unsigned int uint64;
 
 #elif IsIntel_64
 #define BCLK_FREQ 100LU	/* CPU Intel base clock, assume 100 MHz */
+
+#elif IsGrace_64
+#define BCLK_FREQ 1LU	/* Not a base clock: nonzero just enables AMU frequency sampling */
 
 #else
 #define BCLK_FREQ 0LU	/* CPU RPi, frequency sampling not implemented -- change notifications used */
@@ -466,7 +517,7 @@ static const u64 kLlcSmall[16] = {
 /* NOTE: delta_cycles is in increments of cycles/64. The arithmetic */
 /*       below compensates for this. */
 /* 0, 1/8, 1/4, 3/8,  1/2, 5/8, 3/4, 7/8,  1, 5/4, 3/2, 7/4,  2, 5/2, 3, 7/2 */
-inline u64 get_granular_ipc(u64 delta_inst, u64 delta_cycles) {
+static inline u64 get_granular_ipc(u64 delta_inst, u64 delta_cycles) {
   u32 del_inst, del_cycles, ipc;
   if ((delta_cycles & ~1) == 0) return 0; /* Too small to matter; avoid zdiv */
   /* Do 32-bit divide to save ~10 CPU cycles vs. 64-bit */
@@ -494,7 +545,7 @@ inline u64 get_granular_ipc(u64 delta_inst, u64 delta_cycles) {
  * missing two code points instead to extend our range to 64K+ misses 
  * (i.e. 4MB with 64-byte cache lines)
  */
-inline u64 get_granular_llc(u64 delta_llc) {
+static inline u64 get_granular_llc(u64 delta_llc) {
   u64 retval;
   if (delta_llc == 0) return 0;			/* common case, we hope */
   if ((delta_llc & ~CLU(0x7)) == 0) return 1;		/* 1..7 */
@@ -518,6 +569,166 @@ inline u64 get_granular_llc(u64 delta_llc) {
   }
   return retval - 1;
 }
+
+
+#if IsGrace_64
+/* arm64 server state                                                         */
+/*----------------------------------------------------------------------------*/
+
+/* Neoverse V2 PMUv3 event numbers. See tools/perf/pmu-events/arch/arm64/   */
+/* arm/neoverse-n2-v2/ and the Neoverse V2 TRM.                             */
+#define ARM_INST_RETIRED	0x08
+#define ARM_CPU_CYCLES		0x11
+#define ARM_L2D_CACHE_REFILL	0x17
+#define ARM_LL_CACHE_MISS_RD	0x37	/* Grace: SCF (system level cache) read misses */
+
+/* Module parameter: PMU event used for "LLC misses". 0x37 needs firmware to */
+/* set CPUECTLR_EL1.EXTLLC; if it reads as all zeros use 0x17 instead.       */
+static long int llc_event = ARM_LL_CACHE_MISS_RD;
+module_param(llc_event, long, S_IRUSR);
+MODULE_PARM_DESC(llc_event, "arm64 PMU event number counted as LLC misses (0x37)");
+
+/* Shift applied to CNTVCT_EL0 so the trace time base is <= 64 MHz */
+/* Grace CNTFRQ is 1 GHz, so shift 4 gives 62.5 MHz (16 ns)       */
+/* The user-mode kutrace_lib.cc computes exactly the same shift    */
+static u32 ku_cntvct_shift;
+static u64 ku_cntfrq_mhz;
+
+/* True if this CPU has the Activity Monitors with core+const counters on */
+static bool ku_have_amu;
+
+/* Per-CPU module-private state, so include/linux/kutrace.h stays the same as x86 */
+struct ku_arm_pcpu {
+	struct perf_event *inst_ev;	/* INST_RETIRED */
+	struct perf_event *cyc_ev;	/* CPU_CYCLES */
+	struct perf_event *llc_ev;	/* llc_event */
+	u64 prior_cpu_cycles;		/* real core cycles, for IPC */
+	u64 prior_amu_core;		/* AMU frequency sampling */
+	u64 prior_amu_const;
+};
+static DEFINE_PER_CPU(struct ku_arm_pcpu, ku_arm_pcpu);
+
+/* Read the PMU counter that perf assigned to this event on this CPU.       */
+/* perf owns the counter (no clash with the NMI watchdog or perf users) and */
+/* it is 64-bit (attr.config1 "long"), but we read it with a single mrs.    */
+/* hw.idx is re-read each time because perf may reschedule pinned events.  */
+static inline u64 ku_read_pmu(struct perf_event *ev)
+{
+	int idx;
+
+	if (unlikely(ev == NULL))
+		return 0;
+	idx = READ_ONCE(ev->hw.idx);
+	if (idx == ARMV8_PMU_CYCLE_IDX)
+		return read_pmccntr();
+	if (idx == ARMV8_PMU_INSTR_IDX)
+		return read_pmicntr();
+	if ((idx >= 0) && (idx < ARMV8_PMU_CYCLE_IDX))
+		return read_pmevcntrn(idx);
+	return 0;	/* event not currently scheduled on a counter */
+}
+
+static struct perf_event *ku_make_counter(int cpu, u64 event_num)
+{
+	struct perf_event *ev;
+	struct perf_event_attr attr = {
+		.type		= PERF_TYPE_RAW,
+		.size		= sizeof(struct perf_event_attr),
+		.config		= event_num,
+		.config1	= 1,	/* "long": 64-bit counter, no overflow reprogramming */
+		.pinned		= 1,
+		.disabled	= 0,
+		/* Count EL0 and kernel. On a VHE host (Grace) the kernel runs at */
+		/* EL2; perf sets PMEVTYPER.NSH for us when exclude_kernel == 0   */
+		.exclude_user	= 0,
+		.exclude_kernel	= 0,
+		.exclude_hv	= 0,
+	};
+
+	ev = perf_event_create_kernel_counter(&attr, cpu, NULL, NULL, NULL);
+	if (IS_ERR(ev)) {
+		printk(KERN_INFO "  kutrace_mod cpu %d: perf event 0x%llx failed %ld\n",
+		       cpu, event_num, PTR_ERR(ev));
+		return NULL;
+	}
+	return ev;
+}
+
+static void ku_release_counter(struct perf_event **evp)
+{
+	if (*evp) {
+		perf_event_release_kernel(*evp);
+		*evp = NULL;
+	}
+}
+
+/* Process context only (kutrace_control reset, module init/exit). May sleep. */
+static void ku_release_pmu(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct ku_arm_pcpu *p = per_cpu_ptr(&ku_arm_pcpu, cpu);
+
+		ku_release_counter(&p->inst_ev);
+		ku_release_counter(&p->cyc_ev);
+		ku_release_counter(&p->llc_ev);
+	}
+}
+
+/* Process context only. Returns false if any counter could not be had */
+static bool ku_reserve_pmu(bool want_ipc, bool want_llc)
+{
+	int cpu;
+	bool ok = true;
+
+	ku_release_pmu();
+	for_each_online_cpu(cpu) {
+		struct ku_arm_pcpu *p = per_cpu_ptr(&ku_arm_pcpu, cpu);
+
+		if (want_ipc) {
+			p->inst_ev = ku_make_counter(cpu, ARM_INST_RETIRED);
+			p->cyc_ev  = ku_make_counter(cpu, ARM_CPU_CYCLES);
+			ok &= (p->inst_ev != NULL) && (p->cyc_ev != NULL);
+		}
+		if (want_llc) {
+			p->llc_ev = ku_make_counter(cpu, (u64)llc_event);
+			ok &= (p->llc_ev != NULL);
+		}
+		p->prior_cpu_cycles = 0;
+	}
+	return ok;
+}
+
+static void ku_check_amu_one(void *info)
+{
+	/* Bit 0: core cycles, bit 1: constant cycles. Firmware/kernel must enable */
+	u64 en = read_sysreg_s(SYS_AMCNTENSET0_EL0);
+	if ((en & 3) != 3)
+		ku_have_amu = false;
+}
+
+static void ku_setup_arm64(void)
+{
+	u64 cntfrq = read_sysreg(cntfrq_el0);
+
+	ku_cntfrq_mhz = cntfrq / 1000000;
+	ku_cntvct_shift = 0;
+	while ((cntfrq >> ku_cntvct_shift) > 64000000)
+		++ku_cntvct_shift;
+	printk(KERN_INFO "  kutrace_mod CNTFRQ %llu Hz, time base shift %u\n",
+	       cntfrq, ku_cntvct_shift);
+
+	/* Only touch AMU registers if the CPU feature was detected, else UNDEF */
+	preempt_disable();	/* this_cpu_has_cap() warns if preemptible */
+	ku_have_amu = this_cpu_has_cap(ARM64_HAS_AMU_EXTN);
+	preempt_enable();
+	if (ku_have_amu)
+		on_each_cpu(ku_check_amu_one, NULL, 1);
+	printk(KERN_INFO "  kutrace_mod AMU frequency sampling %s\n",
+	       ku_have_amu ? "on" : "off (using cpufreq policy->cur)");
+}
+#endif	/* IsGrace_64 */
 
 
 /* Machine-specific register Access utilities */
@@ -548,9 +759,9 @@ static inline void wrMSR(u32 msr, u64 value)
 /* Set up global state for reading scaled CPU cycles */
 /* This needs to run once on each CPU core */
 /* For ARM, make sure it increments every 64 cycles, not 1 */
-void ku_setup_timecount(void)
+static void ku_setup_timecount(void)
 {
-#if IsRPi4_64
+#if IsArm_64
 	/* No setup needed for cntvct */
 #elif Isx86_64
 	/* No setup needed for rdtsc */
@@ -563,7 +774,7 @@ void ku_setup_timecount(void)
 
 /* Set up global state for reading instructions retired */
 /* This needs to run once on each CPU core */
-void ku_setup_inst_retired(void)
+static void ku_setup_inst_retired(void)
 {
 #if IsAmd_64
 	u64 inst_ret_enable;
@@ -604,6 +815,9 @@ void ku_setup_inst_retired(void)
 	asm volatile("mrs %x0, pmcntenset_el0" : "=r" (r));
 	asm volatile("msr pmcntenset_el0, %x0" : : "r" (r|1<<2));	/* enable cntr[2] */
 
+#elif IsGrace_64
+	/* Nothing per-CPU: counters are reserved through perf in do_reset() */
+
 #else
 #error Define ku_setup_inst_retired for your architecture
 
@@ -612,7 +826,7 @@ void ku_setup_inst_retired(void)
 
 /* Set up global state for reading instructions retired */
 /* This needs to run once on each CPU core */
-void ku_setup_llc_miss(void)
+static void ku_setup_llc_miss(void)
 {
 #if IsIntel_64
 	u64 llc_miss_sel;
@@ -627,17 +841,19 @@ void ku_setup_llc_miss(void)
 	llc_miss_enable = rdMSR(IA32_PERF_GLOBAL_CTRL);
 	llc_miss_enable |= PMC1_EN;
 	wrMSR(IA32_PERF_GLOBAL_CTRL, llc_miss_enable);
+#elif IsGrace_64
+	/* Nothing per-CPU: counters are reserved through perf in do_reset() */
 #else
-	/* Not implemented for AMD, RPi */
-#error Define ku_setup_llc_miss for your architecture
-
+	/* Not implemented for AMD, RPi. This used to be an #error, which made */
+	/* the module fail to compile everywhere except Intel. do_reset() now  */
+	/* refuses DO_LLC on these instead.                                    */
 #endif
 }
 
 
 /* Set up global state for reading CPU frequency */
 /* This needs to run once on each CPU core */
-void ku_setup_cpu_freq(void)
+static void ku_setup_cpu_freq(void)
 {
 	/* No setup for AMD, Intel, RPi4 */
 }
@@ -652,11 +868,15 @@ void ku_setup_cpu_freq(void)
 /* This is performance critical -- every trace entry  */
 /* Ideally, this counts at a constant rate of 16-32 nsec per count.           */
 /*----------------------------------------------------------------------------*/
-inline u64 ku_get_timecount(void)
+static inline u64 ku_get_timecount(void)
 {
 	u64 timer_value;
 #if IsRPi4_64
 	asm volatile("mrs %x0, cntvct_el0" : "=r"(timer_value));
+#elif IsGrace_64
+	/* No isb: like rdtsc, a few ns of speculation slop is fine here */
+	asm volatile("mrs %x0, cntvct_el0" : "=r"(timer_value));
+	timer_value >>= ku_cntvct_shift;	/* 1 GHz >> 4 = 62.5 MHz on Grace */
 #elif Isx86_64
 	/* If you change this shift amount, change it in kutrace_lib.cc also */
 	timer_value = rdtsc() >> 6;		/* Both AMD and Intel */
@@ -672,7 +892,7 @@ inline u64 ku_get_timecount(void)
 /* Read instructions retired counter */
 /* This is performance critical -- every trace entry if tracking IPC */
 /*----------------------------------------------------------------------------*/
-inline u64 ku_get_inst_retired(void)
+static inline u64 ku_get_inst_retired(void)
 {
 #if IsAmd_64
 	u32 a = 0, d = 0;
@@ -693,6 +913,9 @@ inline u64 ku_get_inst_retired(void)
 	asm volatile("mrs %x0, pmevcntr2_el0" : "=r" (value));
 	return value;
 
+#elif IsGrace_64
+	return ku_read_pmu(this_cpu_read(ku_arm_pcpu.inst_ev));
+
 #else
 #error Define inst_retired for your architecture
 	return 0;
@@ -704,16 +927,17 @@ inline u64 ku_get_inst_retired(void)
 /* Read LLC misses counter */
 /* This is performance critical -- every trace entry if tracking LLC */
 /*----------------------------------------------------------------------------*/
-inline u64 ku_get_llc_miss(void)
+static inline u64 ku_get_llc_miss(void)
 {
 #if IsIntel_64
 	u32 a = 0, d = 0;
 	int ecx = IA32_PMC1;		/* What counter it selects, Intel */
 	__asm __volatile("rdmsr" : "=a"(a), "=d"(d) : "c"(ecx));
 	return ((u64)a) | (((u64)d) << 32);
+#elif IsGrace_64
+	return ku_read_pmu(this_cpu_read(ku_arm_pcpu.llc_ev));
 #else
-	/* Not implemented for AMD, RPi */
-#error Define llc_miss for your architecture
+	/* Not implemented for AMD, RPi; do_reset() refuses DO_LLC */
 	return 0;
 #endif
 }
@@ -721,7 +945,7 @@ inline u64 ku_get_llc_miss(void)
 /* Read current CPU frequency */
 /* Not performance critical -- once every timer interrupt                     */
 /*----------------------------------------------------------------------------*/
-inline u64 ku_get_cpu_freq(void) {
+static inline u64 ku_get_cpu_freq(void) {
 #if !BCLK_FREQ
 	return 0;
 
@@ -740,6 +964,29 @@ inline u64 ku_get_cpu_freq(void) {
         freq *= BCLK_FREQ;	/* base clock in MHz */
 	return freq;
 
+#elif IsGrace_64
+	/* Average frequency since the previous timer-interrupt sample, from   */
+	/* the AMU: core cycles / constant cycles * CNTFRQ. Both counters stop */
+	/* in WFI, so this is the frequency while running, not diluted by idle.*/
+	/* Called from the timer IRQ, so preemption is already off.            */
+	struct ku_arm_pcpu *p = this_cpu_ptr(&ku_arm_pcpu);
+	u64 core, cnst, d_core, d_const, freq = 0;
+
+	if (!ku_have_amu) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get_raw(smp_processor_id());
+		return policy ? policy->cur / 1000 : 0;	/* kHz to MHz */
+	}
+	core = read_sysreg_s(SYS_AMEVCNTR0_CORE_EL0);
+	cnst = read_sysreg_s(SYS_AMEVCNTR0_CONST_EL0);
+	d_core = core - p->prior_amu_core;
+	d_const = cnst - p->prior_amu_const;
+	/* Need >= ~10 usec of running time for a stable ratio */
+	if ((p->prior_amu_const != 0) && (d_const >= 10 * ku_cntfrq_mhz))
+		freq = div64_u64(d_core * ku_cntfrq_mhz, d_const);
+	p->prior_amu_core = core;
+	p->prior_amu_const = cnst;
+	return freq;
+
 #else
 #error Define cpu_freq for your architecture
 	return 0;
@@ -748,20 +995,20 @@ inline u64 ku_get_cpu_freq(void) {
 }
 
 /* Return true for large time advance that should be treated as small backward time */
-inline bool LateStoreOrLarge(u64 delta_cycles) {
+static inline bool LateStoreOrLarge(u64 delta_cycles) {
   return delta_cycles > kLateStoreThresh;
 }
 
 /* Make sure name length fits in 1..8 u64's */
 //* Return true if out of range */
-inline bool is_bad_len(int len)
+static inline bool is_bad_len(int len)
 {
 	return (len < 1) | (len > 8);
 }
 
 /* Make sure name length fits in 1 + 1..8 u64's */
 /* Return true if out of range */
-inline bool is_bad_len_plus(int len)
+static inline bool is_bad_len_plus(int len)
 {
 	return (len < 1) | (len > 9);
 }
@@ -1067,7 +1314,7 @@ static u64 *initialize_trace_block(u64 *init_me, bool very_first_block,
 			ku_setup_llc_miss();
 			ku_setup_cpu_freq();
 			tb->prior_cycles = 1;	/* mark it as initialized */
-#if IsRPi4_64
+#if IsRPi4_64 || IsGrace_64
 			{
 			struct cpufreq_policy *policy = cpufreq_cpu_get_raw(cpu);
 			/* For Rpi4, put current CPU freq (MHz) into block at high half of myclaim[-4] */
@@ -1249,7 +1496,7 @@ static u64 *get_claim(int len, struct kutrace_traceblock* tb)
 /* NOTE: tsdelta is bogus for very first entry per CPU. */
 /*       First per CPU is indicated by tb->prior_cycles == 0 */
 /* We are called with preempt disabled */
-inline u64* get_claim_with_tsdelta(u64 now, u64 delta_cycles,  
+static inline u64* get_claim_with_tsdelta(u64 now, u64 delta_cycles,  
                                    int len, struct kutrace_traceblock* tb) {
 	u64 *claim;
 	/* Check if time between events almost wraps above the 20-bit timestamp */
@@ -1293,13 +1540,25 @@ inline static u64 *get_prior(struct kutrace_traceblock *tb)
 /* If either IPC or LLC is on, store its quantized 4-bit value */
 /* If both are on keep just high two bits of each. HTML wrapper displays both */
 /* Prioritize do_ipc */
-inline void do_ipcllc_calc(u64 *claim, u64 delta_cycles, 
+static inline void do_ipcllc_calc(u64 *claim, u64 delta_cycles, 
                         struct kutrace_traceblock* tb, bool shift) {
         u64 inst_ret, delta_inst, ipc;
 	u64 llc_miss, delta_miss, llc;
 	u64 four_bits;	/* To store into trace: ipc, llc, or two bits of each */
 	u8* ipcllc_byte_addr;
 	
+#if IsGrace_64
+	/* The incoming delta_cycles is in time-base units (CNTVCT >> shift), */
+	/* not CPU cycles, and Grace changes frequency. Use real CPU_CYCLES,  */
+	/* in units of cycles/64 like the x86 rdtsc>>6 path expects.          */
+	if (do_ipc) {
+		struct ku_arm_pcpu *p = this_cpu_ptr(&ku_arm_pcpu);
+		u64 cyc = ku_read_pmu(p->cyc_ev);
+		delta_cycles = (cyc - p->prior_cpu_cycles) >> 6;
+		p->prior_cpu_cycles = cyc;
+	}
+#endif
+
 	/* There will be random large differences the first time; we don't care. */
 	if (do_ipc_only) {
 		inst_ret = ku_get_inst_retired();
@@ -1559,6 +1818,22 @@ static u64 do_reset(u64 flags)
 	do_ipc = ((flags & DO_IPC) != 0);
 	do_llc = ((flags & DO_LLC) != 0);
 	do_wrap = ((flags & DO_WRAP) != 0);
+#if !(IsIntel_64 || IsGrace_64)
+	if (do_llc) {
+		printk(KERN_INFO "  kutrace_mod: LLC misses not implemented here; ignoring\n");
+		do_llc = false;
+	}
+#endif
+#if IsGrace_64
+	/* We are in process context (kutrace_control syscall or module init) */
+	if (do_ipc || do_llc) {
+		if (!ku_reserve_pmu(do_ipc, do_llc))
+			printk(KERN_INFO "  kutrace_mod: some PMU counters unavailable; "
+			       "their IPC/LLC values will read as 0\n");
+	} else {
+		ku_release_pmu();
+	}
+#endif
 	do_neither = (!do_ipc) & (!do_llc);
 	do_both = (do_ipc & do_llc);
 	do_ipc_only = (do_ipc & !do_llc);
@@ -1672,7 +1947,8 @@ static u64 kutrace_control(u64 command, u64 arg)
 	}
 
 	/* If checking, disallow calls from tasks without CAP_SYS_PTRACE */
-	if (check && !has_capability(current, CAP_SYS_PTRACE)) 
+	/* has_capability() is no longer exported in 6.17/7.0; capable() checks current */
+	if (check && !capable(CAP_SYS_PTRACE)) 
 		return ~CLU(0);
 
 	/* Generally, more likely calls are near the front of this list */
@@ -1800,6 +2076,10 @@ static int __init kutrace_mod_init(void)
 #if IsRPi4_64
 	printk(KERN_INFO "IsRPi4_64");
 #endif
+#if IsGrace_64
+	printk(KERN_INFO "IsGrace_64");
+	ku_setup_arm64();
+#endif
 
 	/* Set up global tracing data state */
 	/* Very first traceblock alloc per CPU will do this, but we need */
@@ -1852,6 +2132,10 @@ static void __exit kutrace_mod_exit(void)
 	traceblock_high = NULL;
 	traceblock_limit = NULL;
 	traceblock_next = NULL;
+
+#if IsGrace_64
+	ku_release_pmu();
+#endif
 
 	/* Now that nothing points to it, free memory */
 	if (tracebase) {vfree(tracebase);}
